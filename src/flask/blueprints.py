@@ -9,7 +9,7 @@ from .scaffold import _endpoint_from_view_func
 from .scaffold import _sentinel
 from .scaffold import Scaffold
 from .scaffold import setupmethod
-
+//updated
 if t.TYPE_CHECKING:  # pragma: no cover
     from .app import Flask
 
