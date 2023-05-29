@@ -9,6 +9,435 @@ from .scaffold import _endpoint_from_view_func
 from .scaffold import _sentinel
 from .scaffold import Scaffold
 from .scaffold import setupmethod
+@Trace
+@Singleton
+public class ElasticSearchDAO implements IndexDAO {
+
+	private static final Logger logger = LoggerFactory.getLogger(ElasticSearchDAO.class);
+
+	private static final String WORKFLOW_DOC_TYPE = "workflow";
+
+	private static final String TASK_DOC_TYPE = "task";
+
+	private static final String LOG_DOC_TYPE = "task_log";
+
+	private static final String EVENT_DOC_TYPE = "event";
+
+	private static final String MSG_DOC_TYPE = "message";
+
+	private static final String className = ElasticSearchDAO.class.getSimpleName();
+
+	private static final int RETRY_COUNT = 3;
+
+	private final int archiveSearchBatchSize;
+
+	private String indexName;
+
+	private String logIndexName;
+
+	private String logIndexPrefix;
+
+	private ObjectMapper objectMapper;
+
+	private Client elasticSearchClient;
+
+	private static final TimeZone GMT = TimeZone.getTimeZone("GMT");
+
+	private static final SimpleDateFormat SIMPLE_DATE_FORMAT = new SimpleDateFormat("yyyyMMWW");
+
+	private final ExecutorService executorService;
+	private final ExecutorService logExecutorService;
+
+	static {
+		SIMPLE_DATE_FORMAT.setTimeZone(GMT);
+	}
+
+	@Inject
+	public ElasticSearchDAO(Client elasticSearchClient, Configuration config, ObjectMapper objectMapper) {
+		this.objectMapper = objectMapper;
+		this.elasticSearchClient = elasticSearchClient;
+		this.indexName = config.getProperty("workflow.elasticsearch.index.name", null);
+		this.archiveSearchBatchSize = config.getIntProperty("workflow.elasticsearch.archive.search.batchSize", 5000);
+
+		int corePoolSize = 4;
+		int maximumPoolSize = config.getIntProperty("workflow.elasticsearch.async.dao.max.pool.size", 12);
+		long keepAliveTime = 1L;
+		int workerQueueSize = config.getIntProperty("workflow.elasticsearch.async.dao.worker.queue.size", 100);
+		this.executorService = new ThreadPoolExecutor(corePoolSize,
+			maximumPoolSize,
+			keepAliveTime,
+			TimeUnit.MINUTES,
+			new LinkedBlockingQueue<>(workerQueueSize),
+			(runnable, executor) -> {
+				logger.warn("Request {} to async dao discarded in executor {}", runnable, executor);
+				Monitors.recordDiscardedIndexingCount("indexQueue");
+			});
+
+		corePoolSize = 1;
+		maximumPoolSize = 2;
+		keepAliveTime = 30L;
+		this.logExecutorService = new ThreadPoolExecutor(corePoolSize,
+			maximumPoolSize,
+			keepAliveTime,
+			TimeUnit.SECONDS,
+			new LinkedBlockingQueue<>(workerQueueSize),
+			(runnable, executor) -> {
+				logger.warn("Request {} to async log dao discarded in executor {}", runnable, executor);
+				Monitors.recordDiscardedIndexingCount("logQueue");
+			});
+
+		try {
+			initIndex();
+			updateIndexName(config);
+			Executors.newScheduledThreadPool(1).scheduleAtFixedRate(() -> updateIndexName(config), 0, 1, TimeUnit.HOURS);
+
+		} catch (Exception e) {
+			logger.error(e.getMessage(), e);
+		}
+	}
+
+	@PreDestroy
+	private void shutdown() {
+		logger.info("Gracefully shutdown executor service");
+		shutdownExecutorService(logExecutorService);
+		shutdownExecutorService(executorService);
+	}
+
+	private void shutdownExecutorService(ExecutorService execService) {
+		try {
+			execService.shutdown();
+			if (execService.awaitTermination(30, TimeUnit.SECONDS)) {
+				logger.debug("tasks completed, shutting down");
+			} else {
+				logger.warn("forcing shutdown after waiting for 30 seconds");
+				execService.shutdownNow();
+			}
+		} catch (InterruptedException ie) {
+			logger.warn("shutdown interrupted, invoking shutdownNow");
+			execService.shutdownNow();
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	private void updateIndexName(Configuration config) {
+		this.logIndexPrefix = config.getProperty("workflow.elasticsearch.tasklog.index.name", "task_log");
+		this.logIndexName = this.logIndexPrefix + "_" + SIMPLE_DATE_FORMAT.format(new Date());
+
+		try {
+			elasticSearchClient.admin().indices().prepareGetIndex().addIndices(logIndexName).execute().actionGet();
+		} catch (IndexNotFoundException infe) {
+			try {
+				elasticSearchClient.admin().indices().prepareCreate(logIndexName).execute().actionGet();
+			} catch (IndexAlreadyExistsException ignored) {
+
+			} catch (Exception e) {
+				logger.error("Error creating log index", e);
+			}
+		}
+	}
+
+	/**
+	 * Initializes the index with required templates and mappings.
+	 */
+	private void initIndex() throws Exception {
+
+		//0. Add the tasklog template
+		GetIndexTemplatesResponse result = elasticSearchClient.admin().indices().prepareGetTemplates("tasklog_template").execute().actionGet();
+		if (result.getIndexTemplates().isEmpty()) {
+			logger.info("Creating the index template 'tasklog_template'");
+			InputStream stream = ElasticSearchDAO.class.getResourceAsStream("/template_tasklog.json");
+			byte[] templateSource = IOUtils.toByteArray(stream);
+
+			try {
+				elasticSearchClient.admin().indices().preparePutTemplate("tasklog_template").setSource(templateSource).execute().actionGet();
+			} catch (Exception e) {
+				logger.error("Failed to init tasklog_template", e);
+			}
+		}
+
+		//1. Create the required index
+		try {
+			elasticSearchClient.admin().indices().prepareGetIndex().addIndices(indexName).execute().actionGet();
+		} catch (IndexNotFoundException infe) {
+			try {
+				elasticSearchClient.admin().indices().prepareCreate(indexName).execute().actionGet();
+			} catch (IndexAlreadyExistsException ignored) {
+			}
+		}
+
+		//2. Add Mappings for the workflow document type
+		GetMappingsResponse getMappingsResponse = elasticSearchClient.admin().indices().prepareGetMappings(indexName).addTypes(WORKFLOW_DOC_TYPE).execute().actionGet();
+		if (getMappingsResponse.mappings().isEmpty()) {
+			logger.info("Adding the workflow type mappings");
+			InputStream stream = ElasticSearchDAO.class.getResourceAsStream("/mappings_docType_workflow.json");
+			byte[] bytes = IOUtils.toByteArray(stream);
+			String source = new String(bytes);
+			try {
+				elasticSearchClient.admin().indices().preparePutMapping(indexName).setType(WORKFLOW_DOC_TYPE).setSource(source).execute().actionGet();
+			} catch (Exception e) {
+				logger.error(e.getMessage(), e);
+			}
+		}
+
+		//3. Add Mappings for task document type
+		getMappingsResponse = elasticSearchClient.admin().indices().prepareGetMappings(indexName).addTypes(TASK_DOC_TYPE).execute().actionGet();
+		if (getMappingsResponse.mappings().isEmpty()) {
+			logger.info("Adding the task type mappings");
+			InputStream stream = ElasticSearchDAO.class.getResourceAsStream("/mappings_docType_task.json");
+			byte[] bytes = IOUtils.toByteArray(stream);
+			String source = new String(bytes);
+			try {
+				elasticSearchClient.admin().indices().preparePutMapping(indexName).setType(TASK_DOC_TYPE).setSource(source).execute().actionGet();
+			} catch (Exception e) {
+				logger.error(e.getMessage(), e);
+			}
+		}
+	}
+
+	@Override
+	public void setup() {
+	}
+
+	@Override
+	public void indexWorkflow(Workflow workflow) {
+		try {
+			long startTime = Instant.now().toEpochMilli();
+			String workflowId = workflow.getWorkflowId();
+			WorkflowSummary summary = new WorkflowSummary(workflow);
+			byte[] doc = objectMapper.writeValueAsBytes(summary);
+
+			logger.debug("Indexing workflow document: {}", workflowId);
+			UpdateRequest req = new UpdateRequest(indexName, WORKFLOW_DOC_TYPE, workflowId);
+			req.doc(doc);
+			req.upsert(doc);
+			req.retryOnConflict(5);
+			indexDocument(req, WORKFLOW_DOC_TYPE);
+
+			long endTime = Instant.now().toEpochMilli();
+			logger.debug("Time taken {} for indexing workflow: {}", endTime - startTime, workflow.getWorkflowId());
+			Monitors.recordESIndexTime("index_workflow", WORKFLOW_DOC_TYPE, endTime - startTime);
+			Monitors.recordWorkerQueueSize("indexQueue", ((ThreadPoolExecutor) executorService).getQueue().size());
+		} catch (Exception e) {
+			Monitors.error(className, "indexWorkflow");
+			logger.error("Failed to index workflow: {}", workflow.getWorkflowId(), e);
+		}
+	}
+
+	@Override
+	public CompletableFuture<Void> asyncIndexWorkflow(Workflow workflow) {
+		return CompletableFuture.runAsync(() -> indexWorkflow(workflow), executorService);
+	}
+
+	@Override
+	public void indexTask(Task task) {
+		try {
+			long startTime = Instant.now().toEpochMilli();
+			String taskId = task.getTaskId();
+			TaskSummary summary = new TaskSummary(task);
+			byte[] doc = objectMapper.writeValueAsBytes(summary);
+
+			logger.debug("Indexing task document: {} for workflow: {}" + taskId, task.getWorkflowInstanceId());
+			UpdateRequest req = new UpdateRequest(indexName, TASK_DOC_TYPE, taskId);
+			req.doc(doc);
+			req.upsert(doc);
+			indexDocument(req, TASK_DOC_TYPE);
+
+			long endTime = Instant.now().toEpochMilli();
+			logger.debug("Time taken {} for  indexing task:{} in workflow: {}", endTime - startTime, task.getTaskId(), task.getWorkflowInstanceId());
+			Monitors.recordESIndexTime("index_task", TASK_DOC_TYPE, endTime - startTime);
+			Monitors.recordWorkerQueueSize("indexQueue", ((ThreadPoolExecutor) executorService).getQueue().size());
+		} catch (Exception e) {
+			Monitors.error(className, "indexTask");
+			logger.error("Failed to index task: {}", task.getTaskId(), e);
+		}
+	}
+
+	@Override
+	public CompletableFuture<Void> asyncIndexTask(Task task) {
+		return CompletableFuture.runAsync(() -> indexTask(task), executorService);
+	}
+
+	@Override
+	public void addTaskExecutionLogs(List<TaskExecLog> taskExecLogs) {
+		if (taskExecLogs.isEmpty()) {
+			return;
+		}
+
+		try {
+			long startTime = Instant.now().toEpochMilli();
+			BulkRequestBuilder bulkRequestBuilder = elasticSearchClient.prepareBulk();
+			for (TaskExecLog taskExecLog : taskExecLogs) {
+				IndexRequest request = new IndexRequest(logIndexName, LOG_DOC_TYPE);
+				request.source(objectMapper.writeValueAsBytes(taskExecLog));
+				bulkRequestBuilder.add(request);
+			}
+			new RetryUtil<BulkResponse>().retryOnException(
+				() -> bulkRequestBuilder.execute().actionGet(5, TimeUnit.SECONDS),
+				null,
+				BulkResponse::hasFailures,
+				RETRY_COUNT,
+				"Indexing task execution logs",
+				"addTaskExecutionLogs"
+			);
+			long endTime = Instant.now().toEpochMilli();
+			logger.debug("Time taken {} for indexing taskExecutionLogs", endTime - startTime);
+			Monitors.recordESIndexTime("index_task_execution_logs", LOG_DOC_TYPE, endTime - startTime);
+			Monitors.recordWorkerQueueSize("logQueue", ((ThreadPoolExecutor) logExecutorService).getQueue().size());
+		} catch (Exception e) {
+			List<String> taskIds = taskExecLogs.stream()
+				.map(TaskExecLog::getTaskId)
+				.collect(Collectors.toList());
+			logger.error("Failed to index task execution logs for tasks: {}", taskIds, e);
+		}
+	}
+
+	@Override
+	public CompletableFuture<Void> asyncAddTaskExecutionLogs(List<TaskExecLog> logs) {
+		return CompletableFuture.runAsync(() -> addTaskExecutionLogs(logs), logExecutorService);
+	}
+
+	@Override
+	public List<TaskExecLog> getTaskExecutionLogs(String taskId) {
+
+		try {
+
+			QueryBuilder qf;
+			Expression expression = Expression.fromString("taskId='" + taskId + "'");
+			qf = expression.getFilterBuilder();
+
+			BoolQueryBuilder filterQuery = QueryBuilders.boolQuery().must(qf);
+			QueryStringQueryBuilder stringQuery = QueryBuilders.queryStringQuery("*");
+			BoolQueryBuilder fq = QueryBuilders.boolQuery().must(stringQuery).must(filterQuery);
+
+			final SearchRequestBuilder srb = elasticSearchClient.prepareSearch(logIndexPrefix + "*").setQuery(fq).setTypes(LOG_DOC_TYPE).addSort(SortBuilders.fieldSort("createdTime").order(SortOrder.ASC).unmappedType("long"));
+			SearchResponse response = srb.execute().actionGet();
+			SearchHit[] hits = response.getHits().getHits();
+			List<TaskExecLog> logs = new ArrayList<>(hits.length);
+			for (SearchHit hit : hits) {
+				String source = hit.getSourceAsString();
+				TaskExecLog tel = objectMapper.readValue(source, TaskExecLog.class);
+				logs.add(tel);
+			}
+
+			return logs;
+
+		} catch (Exception e) {
+			logger.error(e.getMessage(), e);
+		}
+
+		return null;
+	}
+
+	@Override
+	public void addMessage(String queue, Message msg) {
+		try {
+			long startTime = Instant.now().toEpochMilli();
+			Map<String, Object> doc = new HashMap<>();
+			doc.put("messageId", msg.getId());
+			doc.put("payload", msg.getPayload());
+			doc.put("queue", queue);
+			doc.put("created", System.currentTimeMillis());
+
+			logger.debug("Indexing message document: {}", msg.getId());
+			UpdateRequest request = new UpdateRequest(logIndexName, MSG_DOC_TYPE, msg.getId());
+			request.doc(doc, XContentType.JSON);
+			request.upsert(doc, XContentType.JSON);
+			indexDocument(request, MSG_DOC_TYPE);
+
+			long endTime = Instant.now().toEpochMilli();
+			logger.debug("Time taken {} for  indexing message: {}", endTime - startTime, msg.getId());
+			Monitors.recordESIndexTime("add_message", MSG_DOC_TYPE, endTime - startTime);
+		}catch (Exception e) {
+			Monitors.error(className, "addMessage");
+			logger.error("Failed to index message: {}", msg.getId(), e);
+		}
+	}
+
+	@Override
+	public CompletableFuture<Void> asyncAddMessage(String queue, Message message) {
+		return CompletableFuture.runAsync(() -> addMessage(queue, message), executorService);
+	}
+
+	@Override
+	public void addEventExecution(EventExecution eventExecution) {
+		try {
+			long startTime = Instant.now().toEpochMilli();
+			byte[] doc = objectMapper.writeValueAsBytes(eventExecution);
+			String id = eventExecution.getName() + "." + eventExecution.getEvent() + "." + eventExecution.getMessageId() + "." + eventExecution.getId();
+
+			logger.debug("Indexing event document: {}", id);
+			UpdateRequest req = new UpdateRequest(logIndexName, EVENT_DOC_TYPE, id);
+			req.doc(doc);
+			req.upsert(doc);
+			req.retryOnConflict(5);
+			indexDocument(req, EVENT_DOC_TYPE);
+
+			long endTime = Instant.now().toEpochMilli();
+			logger.debug("Time taken {} for indexing event execution: {}", endTime - startTime, eventExecution.getId());
+			Monitors.recordESIndexTime("add_event_execution", EVENT_DOC_TYPE, endTime - startTime);
+		} catch (Exception e) {
+			Monitors.error(className, "addEventExecution");
+			logger.error("Failed to index event execution: {}", eventExecution.getId(), e);
+		}
+	}
+
+	@Override
+	public CompletableFuture<Void> asyncAddEventExecution(EventExecution eventExecution) {
+		return CompletableFuture.runAsync(() -> addEventExecution(eventExecution), logExecutorService);
+	}
+
+	private void indexDocument(UpdateRequest request, String docType) {
+		new RetryUtil<UpdateResponse>().retryOnException(
+			() -> elasticSearchClient.update(request).actionGet(5, TimeUnit.SECONDS),
+			null,
+			null,
+			RETRY_COUNT,
+			"Indexing document of type - " + docType,
+			"indexDocument"
+		);
+	}
+
+	@Override
+	public SearchResult<String> searchWorkflows(String query, String freeText, int start, int count, List<String> sort) {
+		try {
+			return search(query, start, count, sort, freeText, WORKFLOW_DOC_TYPE);
+		} catch (ParserException e) {
+			throw new ApplicationException(Code.BACKEND_ERROR, e.getMessage(), e);
+		}
+	}
+
+	@Override
+	public SearchResult<String> searchTasks(String query, String freeText, int start, int count, List<String> sort) {
+		try {
+			return search(query, start, count, sort, freeText, TASK_DOC_TYPE);
+		} catch (ParserException e) {
+			throw new ApplicationException(Code.BACKEND_ERROR, e.getMessage(), e);
+		}
+	}
+
+	@Override
+	public void removeWorkflow(String workflowId) {
+		try {
+			long startTime = Instant.now().toEpochMilli();
+			DeleteRequest req = new DeleteRequest(indexName, WORKFLOW_DOC_TYPE, workflowId);
+			DeleteResponse response = elasticSearchClient.delete(req).actionGet();
+			if (!response.isFound()) {
+				logger.error("Index removal failed - document not found by id " + workflowId);
+			}
+			long endTime = Instant.now().toEpochMilli();
+			logger.debug("Time taken {} for removing workflow: {}", endTime - startTime, workflowId);
+			Monitors.recordESIndexTime("remove_workflow", WORKFLOW_DOC_TYPE, endTime - startTime);
+			Monitors.recordWorkerQueueSize("indexQueue", ((ThreadPoolExecutor) executorService).getQueue().size());
+		} catch (Exception e) {
+			logger.error("Failed to remove workflow {} from index", workflowId, e);
+			Monitors.error(className, "removeWorkflow");
+		}
+	}
+
+	@Override
+	public CompletableFuture<Void> asyncRemoveWorkflow(String workflowId) {
+		return CompletableFuture.runAsync(() -> removeWorkflow(workflowId), executorService);
+	}
 
 if t.TYPE_CHECKING:  # pragma: no cover
     from .app import Flask
