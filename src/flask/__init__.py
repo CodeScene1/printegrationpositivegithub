@@ -48,6 +48,14 @@ __version__ = "2.3.0.dev"
 def __getattr__(name):
     if name == "_app_ctx_stack":
         import warnings
+
+def __getattr__(name):
+    if name == "_app_ctx_stack":
+        import warnings
+        from .globals import __app_ctx_stack
+
+        warnings.warn(
+            "'_app_ctx_stack' is deprecated and will be removed in Flask 2.3.",
         from .globals import __app_ctx_stack
 
         warnings.warn(
